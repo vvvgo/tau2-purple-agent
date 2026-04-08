@@ -8,7 +8,7 @@ from a2a.server.tasks import TaskUpdater
 from a2a.types import Message, Part, TextPart
 from a2a.utils import get_message_text
 
-from prompts import get_system_prompt, get_periodic_reminder, PLAN_PROMPT, ACT_PROMPT
+from prompts import get_system_prompt, get_periodic_reminder
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,10 +21,8 @@ logger = logging.getLogger(__name__)
 def extract_tool_names(text: str) -> set[str]:
     """Extract tool names from the first message using a broad regex."""
     names = set()
-    # Broad match: any "name": "..." inside tool definitions
     for m in re.finditer(r'"name"\s*:\s*"([^"]+)"', text):
         name = m.group(1)
-        # Filter out non-tool names (descriptions, types, etc.)
         if not any(c in name for c in [" ", ".", ","]) and len(name) < 50:
             names.add(name)
     names.add("respond")
@@ -36,10 +34,7 @@ def strip_thinking(text: str) -> str:
 
 
 def extract_json(text: str) -> dict | None:
-    """Robustly extract JSON from LLM output (handles reasoning text around JSON)."""
     text = strip_thinking(text)
-
-    # Try direct parse
     try:
         parsed = json.loads(text)
         if isinstance(parsed, list) and len(parsed) > 0:
@@ -48,8 +43,6 @@ def extract_json(text: str) -> dict | None:
             return parsed
     except json.JSONDecodeError:
         pass
-
-    # Try code fences
     fence = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
     if fence:
         try:
@@ -57,8 +50,6 @@ def extract_json(text: str) -> dict | None:
             return parsed[0] if isinstance(parsed, list) and parsed else parsed if isinstance(parsed, dict) else None
         except json.JSONDecodeError:
             pass
-
-    # Try first {...} block (handles reasoning text before/after JSON)
     brace = re.search(r"\{.*\}", text, re.DOTALL)
     if brace:
         try:
@@ -66,7 +57,6 @@ def extract_json(text: str) -> dict | None:
             return parsed if isinstance(parsed, dict) else None
         except json.JSONDecodeError:
             pass
-
     return None
 
 
@@ -76,17 +66,19 @@ PLACEHOLDER_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
-# Agent — plan-then-act (2 calls), NO json_mode on plan, temperature=0
+# Agent — single call, JSON mode, with transfer loop protection
 # ---------------------------------------------------------------------------
 
 class Agent:
     def __init__(self):
         self.client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
-        self.model = os.environ.get("AGENT_MODEL", "gpt-5.4-mini")
+        self.model = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
         self.history: list[dict] = []
         self.known_tools: set[str] = set()
         self.turn_count: int = 0
         self.last_tool_sig: str | None = None
+        self._dup_count: int = 0
+        self._transfer_done: bool = False  # Track if transfer already happened
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         user_text = get_message_text(message)
@@ -102,6 +94,19 @@ class Agent:
         self.history.append({"role": "user", "content": user_text})
         self.turn_count += 1
 
+        # If transfer already done, just respond with the transfer message
+        if self._transfer_done:
+            action = {"name": "respond", "arguments": {
+                "content": "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."
+            }}
+            response_text = json.dumps(action)
+            self.history.append({"role": "assistant", "content": response_text})
+            await updater.add_artifact(
+                parts=[Part(root=TextPart(text=response_text))],
+                name="response",
+            )
+            return
+
         # Periodic reminder
         if self.turn_count > 4 and self.turn_count % 8 == 0:
             reminder = get_periodic_reminder(None)
@@ -110,8 +115,12 @@ class Agent:
 
         self._trim_history()
 
-        # Plan-then-act: 2 LLM calls
-        action = await self._plan_and_act()
+        # Single LLM call with JSON mode
+        action = await self._generate_action()
+
+        # If agent calls transfer_to_human_agents, mark it so next turn we just respond
+        if action.get("name") == "transfer_to_human_agents":
+            self._transfer_done = True
 
         response_text = json.dumps(action)
         self.history.append({"role": "assistant", "content": response_text})
@@ -121,25 +130,9 @@ class Agent:
             name="response",
         )
 
-    async def _plan_and_act(self) -> dict:
-        # Step 1: Plan — reasoning in plain text, NOT stored in history
-        plan = await self._call_llm(
-            extra_msg=PLAN_PROMPT,
-            json_mode=False,
-            max_tokens=1024,
-        )
-        logger.info(f"Plan: {plan[:300]}")
-
-        # Step 2: Act — produce JSON action using the plan
-        act_prompt = ACT_PROMPT.format(plan=plan)
-        act_messages = self.history + [{"role": "user", "content": act_prompt}]
-
-        response_text = await self._call_llm(
-            messages=act_messages,
-            json_mode=False,  # NO json_mode — let model reason freely
-            max_tokens=4096,
-        )
-        logger.info(f"Act: {response_text[:200]}")
+    async def _generate_action(self) -> dict:
+        response_text = await self._call_llm(json_mode=True)
+        logger.info(f"LLM: {response_text[:200]}")
 
         action = extract_json(response_text)
 
@@ -147,27 +140,25 @@ class Agent:
         if not action or not self._is_valid(action):
             retry = await self._call_llm(
                 extra_msg=(
-                    "Your previous response was not valid JSON. "
-                    "Output EXACTLY one JSON object: {\"name\": \"<tool>\", \"arguments\": {...}}. "
-                    "Available tools: " + ", ".join(sorted(self.known_tools))
+                    "Your previous response was invalid. "
+                    "Output EXACTLY one JSON: {\"name\": \"<tool>\", \"arguments\": {...}}. "
+                    "Available: " + ", ".join(sorted(self.known_tools))
                 ),
-                json_mode=True,  # Force JSON on retry
+                json_mode=True,
             )
             action = extract_json(retry)
             if not action or not self._is_valid(action):
                 action = {"name": "respond", "arguments": {"content": response_text[:500]}}
 
-        # Duplicate guard (only block if 3+ consecutive identical calls)
+        # Duplicate guard — block after 1 repeat
         sig = json.dumps(action, sort_keys=True)
         if sig == self.last_tool_sig and action["name"] != "respond":
-            # Allow one repeat, block on second
-            if hasattr(self, '_dup_count') and self._dup_count >= 1:
+            self._dup_count += 1
+            if self._dup_count >= 1:
                 action = {"name": "respond", "arguments": {
-                    "content": "I've attempted this action multiple times. Let me try a different approach."
+                    "content": "I've already attempted that action. Let me try a different approach. Could you provide more details or clarify your request?"
                 }}
                 self._dup_count = 0
-            else:
-                self._dup_count = getattr(self, '_dup_count', 0) + 1
         else:
             self._dup_count = 0
         self.last_tool_sig = sig
@@ -204,7 +195,6 @@ class Agent:
         extra_msg: str | None = None,
         messages: list[dict] | None = None,
         json_mode: bool = False,
-        max_tokens: int = 4096,
         max_retries: int = 3,
     ) -> str:
         msgs = messages or list(self.history)
@@ -215,7 +205,7 @@ class Agent:
             "model": self.model,
             "messages": msgs,
             "temperature": 0,
-            "max_completion_tokens": max_tokens,
+            "max_completion_tokens": 4096,
         }
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
@@ -235,6 +225,5 @@ class Agent:
     def _trim_history(self, max_msgs: int = 30):
         if len(self.history) <= max_msgs:
             return
-        # Keep [0]=system, [1]=first user msg (policy+tools), marker, then last N
         marker = {"role": "system", "content": "[Earlier conversation messages omitted. Continue from here.]"}
         self.history = self.history[:2] + [marker] + self.history[-(max_msgs - 3):]
