@@ -12,7 +12,7 @@ COPY src src
 RUN uv sync --locked
 
 ENV OPENAI_API_KEY=""
-ENV AGENT_MODEL="gpt-5.4-mini"
+ENV AGENT_MODEL="gpt-4o-mini"
 
 ENTRYPOINT ["uv", "run", "src/server.py", "--host", "0.0.0.0"]
 CMD ["--port", "9009"]

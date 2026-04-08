@@ -76,9 +76,8 @@ class Agent:
         self.history: list[dict] = []
         self.known_tools: set[str] = set()
         self.turn_count: int = 0
-        self.last_tool_sig: str | None = None
-        self._dup_count: int = 0
-        self._transfer_done: bool = False  # Track if transfer already happened
+        self._last_actions: list[str] = []  # Track last N action signatures
+        self._transfer_done: bool = False
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         user_text = get_message_text(message)
@@ -107,8 +106,8 @@ class Agent:
             )
             return
 
-        # Periodic reminder
-        if self.turn_count > 4 and self.turn_count % 8 == 0:
+        # Periodic reminder — every 6 turns starting from turn 5
+        if self.turn_count >= 5 and self.turn_count % 6 == 0:
             reminder = get_periodic_reminder(None)
             if reminder:
                 self.history.append({"role": "system", "content": reminder})
@@ -118,7 +117,7 @@ class Agent:
         # Single LLM call with JSON mode
         action = await self._generate_action()
 
-        # If agent calls transfer_to_human_agents, mark it so next turn we just respond
+        # If agent calls transfer_to_human_agents, mark it
         if action.get("name") == "transfer_to_human_agents":
             self._transfer_done = True
 
@@ -132,7 +131,7 @@ class Agent:
 
     async def _generate_action(self) -> dict:
         response_text = await self._call_llm(json_mode=True)
-        logger.info(f"LLM: {response_text[:200]}")
+        logger.info(f"LLM: {response_text[:300]}")
 
         action = extract_json(response_text)
 
@@ -150,18 +149,18 @@ class Agent:
             if not action or not self._is_valid(action):
                 action = {"name": "respond", "arguments": {"content": response_text[:500]}}
 
-        # Duplicate guard — block after 1 repeat
+        # Duplicate guard — block after 3 IDENTICAL consecutive non-respond actions
         sig = json.dumps(action, sort_keys=True)
-        if sig == self.last_tool_sig and action["name"] != "respond":
-            self._dup_count += 1
-            if self._dup_count >= 1:
+        if action["name"] != "respond":
+            if len(self._last_actions) >= 3 and all(s == sig for s in self._last_actions[-3:]):
                 action = {"name": "respond", "arguments": {
-                    "content": "I've already attempted that action. Let me try a different approach. Could you provide more details or clarify your request?"
+                    "content": "I've attempted this action multiple times. Let me try a different approach. Could you clarify your request?"
                 }}
-                self._dup_count = 0
+                self._last_actions = []
+            else:
+                self._last_actions.append(sig)
         else:
-            self._dup_count = 0
-        self.last_tool_sig = sig
+            self._last_actions = []
 
         return action
 
@@ -222,8 +221,9 @@ class Agent:
                 await asyncio.sleep(min(2 ** attempt, 10))
         return ""
 
-    def _trim_history(self, max_msgs: int = 30):
+    def _trim_history(self, max_msgs: int = 50):
+        """Keep history manageable but allow enough context for complex tasks."""
         if len(self.history) <= max_msgs:
             return
-        marker = {"role": "system", "content": "[Earlier conversation messages omitted. Continue from here.]"}
+        marker = {"role": "system", "content": "[Earlier conversation messages omitted. Continue from the recent context below.]"}
         self.history = self.history[:2] + [marker] + self.history[-(max_msgs - 3):]

@@ -17,7 +17,7 @@
   config_schema: {
     type: "object",
     properties: {
-      agent_model: { type: "string", default: "gpt-5.4-mini" },
+      agent_model: { type: "string", default: "gpt-4o-mini" },
       openai_api_key: { type: "string", secret: true, default: "" },
     },
     required: [],
