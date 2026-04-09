@@ -18,212 +18,277 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
+def parse_tools_from_prompt(text: str) -> list[dict]:
+    """Extract OpenAI tool schemas from the first message (green agent prompt)."""
+    # The green agent embeds tool schemas as a JSON array in the prompt
+    # Find the array between "tools you can use" and the respond tool
+    try:
+        # Find the JSON array of tools
+        start = text.find('[{"type"')
+        if start == -1:
+            start = text.find('[{\n')
+        if start == -1:
+            return []
+
+        # Find matching end bracket
+        depth = 0
+        end = start
+        for i in range(start, len(text)):
+            if text[i] == '[':
+                depth += 1
+            elif text[i] == ']':
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+
+        tools_json = json.loads(text[start:end])
+        # Convert to OpenAI tools format
+        tools = []
+        for t in tools_json:
+            if isinstance(t, dict):
+                if "type" in t and "function" in t:
+                    tools.append(t)
+                elif "name" in t:
+                    # Already in function format, wrap it
+                    tools.append({"type": "function", "function": t})
+        return tools
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning(f"Failed to parse tools: {e}")
+        return []
+
+
+def extract_policy(text: str) -> str:
+    """Extract the domain policy from the first message."""
+    # Policy is at the beginning, before "Here's a list of tools"
+    marker = "Here's a list of tools"
+    idx = text.find(marker)
+    if idx > 0:
+        return text[:idx].strip()
+    return text[:3000]  # fallback
+
+
 def extract_tool_names(text: str) -> set[str]:
-    """Extract tool names from the first message using a broad regex."""
+    """Extract tool names from the first message using regex."""
     names = set()
     for m in re.finditer(r'"name"\s*:\s*"([^"]+)"', text):
         name = m.group(1)
         if not any(c in name for c in [" ", ".", ","]) and len(name) < 50:
             names.add(name)
-    names.add("respond")
     return names
 
 
-def strip_thinking(text: str) -> str:
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-
-def extract_json(text: str) -> dict | None:
-    text = strip_thinking(text)
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, list) and len(parsed) > 0:
-            return parsed[0]
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-    fence = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
-    if fence:
-        try:
-            parsed = json.loads(fence.group(1))
-            return parsed[0] if isinstance(parsed, list) and parsed else parsed if isinstance(parsed, dict) else None
-        except json.JSONDecodeError:
-            pass
-    brace = re.search(r"\{.*\}", text, re.DOTALL)
-    if brace:
-        try:
-            parsed = json.loads(brace.group())
-            return parsed if isinstance(parsed, dict) else None
-        except json.JSONDecodeError:
-            pass
-    return None
-
-
-PLACEHOLDER_RE = re.compile(
-    r"\b(placeholder|unknown|n/a|dummy|fake|example|xxx|your_|my_)\b", re.IGNORECASE
-)
-
-
 # ---------------------------------------------------------------------------
-# Agent — single call, JSON mode, with transfer loop protection
+# Agent — native function calling with proper message history
 # ---------------------------------------------------------------------------
 
 class Agent:
     def __init__(self):
         self.client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
         self.model = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
-        self.history: list[dict] = []
-        self.known_tools: set[str] = set()
+        self.messages: list[dict] = []  # OpenAI chat messages
+        self.tools: list[dict] = []  # OpenAI tool schemas
+        self.tool_names: set[str] = set()
         self.turn_count: int = 0
-        self._last_actions: list[str] = []  # Track last N action signatures
         self._transfer_done: bool = False
+        self._last_tool_sigs: list[str] = []
+        self._pending_tool_call_id: str | None = None
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         user_text = get_message_text(message)
         if not user_text:
             return
 
-        # First message: extract tools, set system prompt
+        # First message: parse tools and policy from green agent prompt
         if self.turn_count == 0:
-            self.known_tools = extract_tool_names(user_text)
-            self.history.append({"role": "system", "content": get_system_prompt("")})
-            logger.info(f"Tools ({len(self.known_tools)}): {sorted(self.known_tools)}")
+            self._init_from_first_message(user_text)
+        else:
+            # Subsequent messages: tool results or user messages
+            self._add_incoming_message(user_text)
 
-        self.history.append({"role": "user", "content": user_text})
         self.turn_count += 1
 
-        # If transfer already done, just respond with the transfer message
+        # If transfer already done, respond immediately
         if self._transfer_done:
-            action = {"name": "respond", "arguments": {
-                "content": "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."
-            }}
-            response_text = json.dumps(action)
-            self.history.append({"role": "assistant", "content": response_text})
+            response_text = json.dumps({
+                "name": "respond",
+                "arguments": {"content": "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."}
+            })
+            self.messages.append({"role": "assistant", "content": "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."})
             await updater.add_artifact(
                 parts=[Part(root=TextPart(text=response_text))],
                 name="response",
             )
             return
 
-        # Periodic reminder — every 6 turns starting from turn 5
+        # Inject periodic reminder
         if self.turn_count >= 5 and self.turn_count % 6 == 0:
             reminder = get_periodic_reminder(None)
             if reminder:
-                self.history.append({"role": "system", "content": reminder})
+                self.messages.append({"role": "system", "content": reminder})
 
         self._trim_history()
 
-        # Single LLM call with JSON mode
-        action = await self._generate_action()
+        # Generate response using native function calling
+        action_json = await self._generate_action()
 
-        # If agent calls transfer_to_human_agents, mark it
-        if action.get("name") == "transfer_to_human_agents":
+        # Track transfer
+        if action_json.get("name") == "transfer_to_human_agents":
             self._transfer_done = True
 
-        response_text = json.dumps(action)
-        self.history.append({"role": "assistant", "content": response_text})
+        response_text = json.dumps(action_json)
+
+        # Add to history based on what happened
+        action_name = action_json.get("name", "respond")
+        if action_name == "respond":
+            # Text response — store as assistant content
+            self.messages.append({
+                "role": "assistant",
+                "content": action_json.get("arguments", {}).get("content", "")
+            })
+        else:
+            # Tool call — store as assistant with tool_calls
+            tool_call_id = f"call_{self.turn_count}"
+            self.messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": action_name,
+                        "arguments": json.dumps(action_json.get("arguments", {}))
+                    }
+                }]
+            })
+            # We'll get the tool result in the next message
+            self._pending_tool_call_id = tool_call_id
 
         await updater.add_artifact(
             parts=[Part(root=TextPart(text=response_text))],
             name="response",
         )
 
-    async def _generate_action(self) -> dict:
-        response_text = await self._call_llm(json_mode=True)
-        logger.info(f"LLM: {response_text[:300]}")
+    def _init_from_first_message(self, text: str):
+        """Parse first message: extract policy, tools, and user's first message."""
+        # Extract tools from the green agent prompt
+        self.tools = parse_tools_from_prompt(text)
+        self.tool_names = extract_tool_names(text)
+        logger.info(f"Parsed {len(self.tools)} tools: {[t.get('function', {}).get('name', '') for t in self.tools]}")
 
-        action = extract_json(response_text)
+        # Extract just the policy
+        policy = extract_policy(text)
 
-        # Validate — retry once if invalid
-        if not action or not self._is_valid(action):
-            retry = await self._call_llm(
-                extra_msg=(
-                    "Your previous response was invalid. "
-                    "Output EXACTLY one JSON: {\"name\": \"<tool>\", \"arguments\": {...}}. "
-                    "Available: " + ", ".join(sorted(self.known_tools))
-                ),
-                json_mode=True,
-            )
-            action = extract_json(retry)
-            if not action or not self._is_valid(action):
-                action = {"name": "respond", "arguments": {"content": response_text[:500]}}
+        # Build system prompt: our instructions + the domain policy
+        system_content = get_system_prompt("") + "\n\n## DOMAIN POLICY (from environment)\n" + policy
 
-        # Duplicate guard — block after 3 IDENTICAL consecutive non-respond actions
-        sig = json.dumps(action, sort_keys=True)
-        if action["name"] != "respond":
-            if len(self._last_actions) >= 3 and all(s == sig for s in self._last_actions[-3:]):
-                action = {"name": "respond", "arguments": {
-                    "content": "I've attempted this action multiple times. Let me try a different approach. Could you clarify your request?"
-                }}
-                self._last_actions = []
-            else:
-                self._last_actions.append(sig)
+        self.messages = [{"role": "system", "content": system_content}]
+
+        # Extract user messages from the prompt
+        # Green agent sends: agent_prompt + "\n\nNow here are the user messages:\n" + messages
+        user_marker = "Now here are the user messages:\n"
+        idx = text.find(user_marker)
+        if idx >= 0:
+            user_content = text[idx + len(user_marker):].strip()
+            if user_content:
+                self.messages.append({"role": "user", "content": user_content})
         else:
-            self._last_actions = []
+            # Fallback: use everything after the tool definitions
+            last_example = text.rfind('"content": "Hello, how can I help you today?"')
+            if last_example > 0:
+                after = text[last_example:]
+                end_of_examples = after.find('\n\n')
+                if end_of_examples > 0:
+                    remaining = after[end_of_examples:].strip()
+                    if remaining:
+                        self.messages.append({"role": "user", "content": remaining})
 
-        return action
+    def _add_incoming_message(self, text: str):
+        """Add incoming message to history with proper role."""
+        # If we have a pending tool call, this must be the tool result
+        pending_id = getattr(self, '_pending_tool_call_id', None)
+        if pending_id:
+            self.messages.append({
+                "role": "tool",
+                "tool_call_id": pending_id,
+                "content": text
+            })
+            self._pending_tool_call_id = None
+        else:
+            # User message
+            self.messages.append({"role": "user", "content": text})
 
-    def _is_valid(self, action: dict) -> bool:
-        if "name" not in action or "arguments" not in action:
-            return False
-        name, args = action["name"], action["arguments"]
-        if not isinstance(name, str) or not isinstance(args, dict):
-            return False
-        if name not in self.known_tools:
-            logger.warning(f"Unknown tool: {name}, known: {sorted(self.known_tools)}")
-            return False
-        if name != "respond":
-            for v in args.values():
-                if isinstance(v, str) and PLACEHOLDER_RE.search(v):
-                    logger.warning(f"Placeholder in args: {v}")
-                    return False
-        if name == "respond":
-            content = args.get("content", "")
-            if isinstance(content, str) and content.strip().startswith("{"):
-                try:
-                    inner = json.loads(content)
-                    if isinstance(inner, dict) and "name" in inner:
-                        return False
-                except json.JSONDecodeError:
-                    pass
-        return True
-
-    async def _call_llm(
-        self,
-        extra_msg: str | None = None,
-        messages: list[dict] | None = None,
-        json_mode: bool = False,
-        max_retries: int = 3,
-    ) -> str:
-        msgs = messages or list(self.history)
-        if extra_msg:
-            msgs = msgs + [{"role": "user", "content": extra_msg}]
-
+    async def _generate_action(self) -> dict:
+        """Call LLM with native function calling and return action dict."""
         kwargs = {
             "model": self.model,
-            "messages": msgs,
+            "messages": self.messages,
             "temperature": 0,
-            "max_completion_tokens": 4096,
+            "max_completion_tokens": 2048,
         }
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
 
-        for attempt in range(max_retries):
+        # Add tools if we have them
+        if self.tools:
+            kwargs["tools"] = self.tools
+            kwargs["tool_choice"] = "auto"
+
+        for attempt in range(3):
             try:
                 resp = await self.client.chat.completions.create(**kwargs)
-                return resp.choices[0].message.content or ""
+                choice = resp.choices[0]
+                msg = choice.message
+
+                # Case 1: Model wants to call a tool
+                if msg.tool_calls and len(msg.tool_calls) > 0:
+                    tc = msg.tool_calls[0]  # Take first tool call only
+                    try:
+                        args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        args = {}
+
+                    action = {"name": tc.function.name, "arguments": args}
+
+                    # Duplicate guard
+                    sig = json.dumps(action, sort_keys=True)
+                    if len(self._last_tool_sigs) >= 3 and all(s == sig for s in self._last_tool_sigs[-3:]):
+                        self._last_tool_sigs = []
+                        return {"name": "respond", "arguments": {
+                            "content": "I've attempted this action multiple times. Could you clarify your request?"
+                        }}
+                    self._last_tool_sigs.append(sig)
+
+                    return action
+
+                # Case 2: Model responds with text (no tool call)
+                content = msg.content or ""
+                self._last_tool_sigs = []
+
+                # Check if the text content is actually a JSON action (fallback)
+                if content.strip().startswith("{"):
+                    try:
+                        parsed = json.loads(content)
+                        if isinstance(parsed, dict) and "name" in parsed and "arguments" in parsed:
+                            return parsed
+                    except json.JSONDecodeError:
+                        pass
+
+                return {"name": "respond", "arguments": {"content": content}}
+
             except Exception as e:
-                logger.error(f"LLM error (attempt {attempt+1}): {e}")
-                if attempt == max_retries - 1:
-                    raise
+                logger.error(f"LLM error (attempt {attempt + 1}): {e}")
+                if attempt == 2:
+                    return {"name": "respond", "arguments": {
+                        "content": "I apologize, I'm experiencing technical difficulties. Please try again."
+                    }}
                 import asyncio
                 await asyncio.sleep(min(2 ** attempt, 10))
-        return ""
 
-    def _trim_history(self, max_msgs: int = 50):
-        """Keep history manageable but allow enough context for complex tasks."""
-        if len(self.history) <= max_msgs:
+        return {"name": "respond", "arguments": {"content": "I'm having trouble processing your request."}}
+
+    def _trim_history(self, max_msgs: int = 60):
+        """Keep history manageable."""
+        if len(self.messages) <= max_msgs:
             return
-        marker = {"role": "system", "content": "[Earlier conversation messages omitted. Continue from the recent context below.]"}
-        self.history = self.history[:2] + [marker] + self.history[-(max_msgs - 3):]
+        # Keep system message + recent messages
+        marker = {"role": "system", "content": "[Earlier conversation omitted. Continue from recent context.]"}
+        self.messages = self.messages[:1] + [marker] + self.messages[-(max_msgs - 2):]
