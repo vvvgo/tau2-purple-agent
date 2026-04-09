@@ -85,8 +85,8 @@ class Agent:
             await updater.add_artifact(parts=[Part(root=TextPart(text=out))], name="response")
             return
 
-        # Periodic reminder — every 4 turns for better policy adherence
-        if self.turn_count >= 3 and self.turn_count % 4 == 0:
+        # Periodic reminder
+        if self.turn_count >= 5 and self.turn_count % 6 == 0:
             r = get_periodic_reminder(None)
             if r:
                 self.messages.append({"role": "system", "content": r})
@@ -204,7 +204,7 @@ class Agent:
         self._last_tool_sigs.append(sig)
         return action
 
-    def _trim_history(self, max_msgs: int = 80):
+    def _trim_history(self, max_msgs: int = 60):
         if len(self.messages) <= max_msgs:
             return
         marker = {"role": "system", "content": "[Earlier conversation omitted.]"}
