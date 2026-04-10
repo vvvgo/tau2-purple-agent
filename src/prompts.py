@@ -130,8 +130,8 @@ If the user can't provide a reservation_id, iterate ALL their reservations via g
 
 ## RESPONSE FORMAT
 Output ONLY a raw JSON object. No markdown, no code fences, no extra text.
-- Tool call: {{"name": "tool_name", "arguments": {{"param": "value"}}}}
-- User reply: {{"name": "respond", "arguments": {{"content": "message"}}}}
+- Tool call example: {{"name": "get_user_details", "arguments": {{"user_id": "abc123"}}}}
+- User reply example: {{"name": "respond", "arguments": {{"content": "Your reservation has been updated."}}}}
 </instructions>
 """
 
@@ -151,9 +151,9 @@ Now output the single next action as a raw JSON object only. No markdown, no ext
 
 CORRECTION_PROMPT = """\
 Your previous response was not valid JSON. \
-Respond with ONLY a raw JSON object, no other text:
-{"name": "tool_name", "arguments": {...}} or \
-{"name": "respond", "arguments": {"content": "..."}}"""
+Respond with ONLY a raw JSON object, no other text. Example format:
+{"name": "get_user_details", "arguments": {"user_id": "abc123"}} or \
+{"name": "respond", "arguments": {"content": "Your message here."}}"""
 
 PERIODIC_REMINDER = """\
 REMINDER: Re-read the policy before responding. Key rules:
