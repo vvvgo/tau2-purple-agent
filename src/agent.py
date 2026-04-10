@@ -8,7 +8,13 @@ from a2a.server.tasks import TaskUpdater
 from a2a.types import Message, Part, TextPart
 from a2a.utils import get_message_text
 
-from prompts import get_system_prompt, get_periodic_reminder
+from prompts import (
+    get_system_prompt,
+    get_plan_prompt,
+    get_plan_to_action,
+    get_correction_prompt,
+    get_periodic_reminder,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,12 +24,48 @@ USER_MARKER = "Now here are the user messages:\n"
 TOOLS_START = "Here's a list of tools"
 TOOLS_END = "Additionally, you can respond"
 
+MAX_CONTEXT_MESSAGES = 30
 
-def parse_first_message(text: str) -> tuple[str, list[dict], str]:
-    """Parse the green agent's first message into (policy, tools, user_text).
+
+def strip_thinking(text: str) -> str:
+    """Remove <think>...</think> blocks from reasoning model output."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def extract_json(text: str) -> str:
+    """Extract JSON from LLM response, handling markdown code blocks."""
+    text = strip_thinking(text)
+    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        return match.group(0).strip()
+    return text.strip()
+
+
+def parse_action(text: str) -> tuple[dict, bool]:
+    """Parse LLM response into action dict. Returns (action, was_fallback)."""
+    raw = extract_json(text)
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list) and len(parsed) > 0:
+            parsed = parsed[0]
+        if isinstance(parsed, dict) and "name" in parsed and "arguments" in parsed:
+            return parsed, False
+    except (json.JSONDecodeError, KeyError, TypeError):
+        pass
+    logger.warning(f"Could not parse JSON, falling back to respond: {text[:200]}")
+    return {"name": "respond", "arguments": {"content": text}}, True
+
+
+def parse_first_message(text: str) -> tuple[str, set[str], str]:
+    """Parse the green agent's first message into (policy, tool_names, user_text).
 
     Green agent format:
       {policy}\n\nHere's a list of tools...\n[...tools JSON...]\n\nAdditionally...\n\n...\n\nNow here are the user messages:\n{user messages}
+
+    Returns policy text, set of known tool names, and user messages.
     """
     # 1. Extract user messages
     user_text = ""
@@ -35,34 +77,23 @@ def parse_first_message(text: str) -> tuple[str, list[dict], str]:
     ts_idx = text.find(TOOLS_START)
     policy = text[:ts_idx].strip() if ts_idx > 0 else text[:3000]
 
-    # 3. Extract tools JSON array
-    tools = []
-    # Find the [ that starts the array (after "tools you can use")
-    arr_start = text.find("\n[", ts_idx if ts_idx > 0 else 0)
-    if arr_start >= 0:
-        arr_start += 1  # skip the \n
-        # Find the matching ]
-        te_idx = text.find(TOOLS_END)
-        if te_idx > arr_start:
-            chunk = text[arr_start:te_idx].strip()
-            try:
-                tools = json.loads(chunk)
-            except json.JSONDecodeError:
-                logger.warning(f"Failed to parse tools JSON, len={len(chunk)}")
+    # 3. Extract tool names
+    tool_names = {"respond"}
+    for match in re.finditer(r'"name"\s*:\s*"([^"]+)"', text):
+        tool_names.add(match.group(1))
 
-    return policy, tools, user_text
+    return policy, tool_names, user_text
 
 
 class Agent:
     def __init__(self):
         self.client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
         self.model = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
-        self.messages: list[dict] = []  # OpenAI chat format
-        self.tools: list[dict] = []  # OpenAI native tools
+        self.messages: list[dict] = []  # OpenAI chat format (system/user/assistant text only)
+        self.known_tools: set[str] = set()
         self.turn_count: int = 0
         self._transfer_done: bool = False
         self._last_tool_sigs: list[str] = []
-        self._pending_tool_call_id: str | None = None
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         user_text = get_message_text(message)
@@ -72,7 +103,7 @@ class Agent:
         if self.turn_count == 0:
             self._init(user_text)
         else:
-            self._add_message(user_text)
+            self.messages.append({"role": "user", "content": user_text})
 
         self.turn_count += 1
 
@@ -80,55 +111,40 @@ class Agent:
         if self._transfer_done:
             out = json.dumps({"name": "respond", "arguments": {
                 "content": "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."}})
-            self.messages.append({"role": "assistant",
-                "content": "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."})
+            self.messages.append({"role": "assistant", "content": out})
             await updater.add_artifact(parts=[Part(root=TextPart(text=out))], name="response")
             return
 
         # Periodic reminder
-        if self.turn_count >= 5 and self.turn_count % 6 == 0:
+        if self.turn_count >= 5 and self.turn_count % 8 == 0:
             r = get_periodic_reminder(None)
             if r:
                 self.messages.append({"role": "system", "content": r})
 
-        self._trim_history()
+        # ── Call 1: Plan (not stored in history) ──
+        plan_text = await self._call_plan()
 
-        # Call LLM with native tools
-        action = await self._call_llm()
+        # ── Call 2: Execute (stored in history) ──
+        action = await self._call_execute(plan_text)
         logger.info(f"Action: {json.dumps(action)[:300]}")
 
         if action.get("name") == "transfer_to_human_agents":
             self._transfer_done = True
 
-        out = json.dumps(action)
+        # Dedup guard
+        action = self._dedup(action)
 
-        # Update message history
-        name = action.get("name", "respond")
-        if name == "respond":
-            self.messages.append({
-                "role": "assistant",
-                "content": action.get("arguments", {}).get("content", "")
-            })
-        else:
-            cid = f"call_{self.turn_count}"
-            self.messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": cid, "type": "function",
-                    "function": {"name": name, "arguments": json.dumps(action.get("arguments", {}))}
-                }]
-            })
-            self._pending_tool_call_id = cid
+        out = json.dumps(action)
+        self.messages.append({"role": "assistant", "content": out})
 
         await updater.add_artifact(parts=[Part(root=TextPart(text=out))], name="response")
 
     def _init(self, text: str):
-        """Parse green agent's first message, set up system prompt and tools."""
-        policy, tools, user_text = parse_first_message(text)
+        """Parse green agent's first message, set up system prompt."""
+        policy, tool_names, user_text = parse_first_message(text)
 
-        self.tools = tools
-        logger.info(f"Parsed {len(self.tools)} native tools")
+        self.known_tools = tool_names
+        logger.info(f"Parsed {len(self.known_tools)} tool names: {self.known_tools}")
 
         # System prompt = our instructions + domain policy
         self.messages = [{"role": "system", "content": get_system_prompt("") + "\n\n" + policy}]
@@ -137,60 +153,89 @@ class Agent:
         if user_text:
             self.messages.append({"role": "user", "content": user_text})
         else:
-            # Shouldn't happen, but fallback
             self.messages.append({"role": "user", "content": text})
 
-    def _add_message(self, text: str):
-        """Add incoming message — tool result or user message."""
-        if self._pending_tool_call_id:
-            self.messages.append({
-                "role": "tool",
-                "tool_call_id": self._pending_tool_call_id,
-                "content": text
-            })
-            self._pending_tool_call_id = None
-        else:
-            self.messages.append({"role": "user", "content": text})
+    def _get_trimmed_messages(self) -> list[dict]:
+        """Keep system + first user message + last N turns."""
+        if len(self.messages) <= MAX_CONTEXT_MESSAGES:
+            return list(self.messages)
+        preserved = self.messages[:2]
+        preserved.append({
+            "role": "user",
+            "content": "[Earlier conversation messages omitted. Continue from here.]"
+        })
+        recent = self.messages[-(MAX_CONTEXT_MESSAGES - 3):]
+        return preserved + recent
 
-    async def _call_llm(self) -> dict:
-        """Call OpenAI with native function calling."""
-        kwargs = {
-            "model": self.model,
-            "messages": self.messages,
-            "temperature": 0,
-            "max_completion_tokens": 2048,
-        }
-        if self.tools:
-            kwargs["tools"] = self.tools
-            kwargs["tool_choice"] = "auto"
+    async def _call_plan(self) -> str:
+        """Call 1: reasoning step. Result is NOT stored in message history."""
+        try:
+            plan_messages = self._get_trimmed_messages() + [{
+                "role": "user",
+                "content": get_plan_prompt(),
+            }]
+            resp = await self.client.chat.completions.create(
+                model=self.model,
+                messages=plan_messages,
+                temperature=0,
+                max_completion_tokens=1024,
+            )
+            plan = strip_thinking(resp.choices[0].message.content or "")
+            logger.info(f"Plan (first 300): {plan[:300]}")
+            return plan
+        except Exception as e:
+            logger.warning(f"Plan call failed (continuing without plan): {e}")
+            return ""
 
-        for attempt in range(3):
+    async def _call_execute(self, plan_text: str) -> dict:
+        """Call 2: produce JSON action. Result IS stored in message history."""
+        messages = self._get_trimmed_messages()
+        if plan_text:
+            messages = messages + [{
+                "role": "user",
+                "content": get_plan_to_action(plan_text),
+            }]
+
+        for attempt in range(2):
             try:
-                resp = await self.client.chat.completions.create(**kwargs)
-                msg = resp.choices[0].message
+                resp = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0,
+                    max_completion_tokens=4096,
+                )
+                reply = resp.choices[0].message.content or ""
+                logger.info(f"Execute reply (first 300): {reply[:300]}")
 
-                # Native tool call
-                if msg.tool_calls:
-                    tc = msg.tool_calls[0]
-                    try:
-                        args = json.loads(tc.function.arguments)
-                    except json.JSONDecodeError:
-                        args = {}
-                    action = {"name": tc.function.name, "arguments": args}
-                    return self._dedup(action)
+                action, was_fallback = parse_action(reply)
 
-                # Text response
-                content = msg.content or ""
-                self._last_tool_sigs = []
-                return {"name": "respond", "arguments": {"content": content}}
+                # Validate tool name
+                if not was_fallback and self.known_tools and action["name"] not in self.known_tools:
+                    logger.warning(f"Unknown tool '{action['name']}', known: {self.known_tools}")
+                    was_fallback = True
+
+                if not was_fallback:
+                    return action
+
+                # Retry with correction prompt
+                if attempt == 0:
+                    logger.warning("Invalid response, retrying with correction prompt")
+                    messages = messages + [
+                        {"role": "assistant", "content": reply},
+                        {"role": "user", "content": get_correction_prompt()},
+                    ]
+                    continue
+
+                # Final fallback: return as text response
+                return {"name": "respond", "arguments": {"content": reply}}
 
             except Exception as e:
                 logger.error(f"LLM error (attempt {attempt + 1}): {e}")
-                if attempt == 2:
+                if attempt == 1:
                     return {"name": "respond", "arguments": {
                         "content": "Technical difficulties. Please try again."}}
                 import asyncio
-                await asyncio.sleep(min(2 ** attempt, 10))
+                await asyncio.sleep(2)
 
         return {"name": "respond", "arguments": {"content": "Processing error."}}
 
@@ -202,10 +247,6 @@ class Agent:
             return {"name": "respond", "arguments": {
                 "content": "I've attempted this multiple times. Could you clarify?"}}
         self._last_tool_sigs.append(sig)
+        if action.get("name") == "respond":
+            self._last_tool_sigs = []
         return action
-
-    def _trim_history(self, max_msgs: int = 60):
-        if len(self.messages) <= max_msgs:
-            return
-        marker = {"role": "system", "content": "[Earlier conversation omitted.]"}
-        self.messages = self.messages[:1] + [marker] + self.messages[-(max_msgs - 2):]
