@@ -94,6 +94,7 @@ class Agent:
         self.turn_count: int = 0
         self._transfer_done: bool = False
         self._last_tool_sigs: list[str] = []
+        self._cancelled_reservations: set[str] = set()  # prevent cancel loops
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         user_text = get_message_text(message)
@@ -130,6 +131,16 @@ class Agent:
 
         if action.get("name") == "transfer_to_human_agents":
             self._transfer_done = True
+
+        # Cancel loop guard: block re-cancelling same reservation
+        if action.get("name") == "cancel_reservation":
+            rid = action.get("arguments", {}).get("reservation_id", "")
+            if rid in self._cancelled_reservations:
+                logger.warning(f"Blocked duplicate cancel for {rid}")
+                action = {"name": "respond", "arguments": {
+                    "content": f"Reservation {rid} has already been cancelled."}}
+            else:
+                self._cancelled_reservations.add(rid)
 
         # Dedup guard
         action = self._dedup(action)

@@ -49,6 +49,7 @@ When the user asks for multiple changes at once:
 6. If any flight already flown -> cannot cancel -> transfer to human.
 7. For ELIGIBLE reservations: proceed. Even if user says "I know there is no refund" -- if eligible, cancel it.
 8. For NON-ELIGIBLE reservations: REFUSE even if user insists. Eligibility is about policy, not refund preference.
+9. NEVER cancel a reservation that is already cancelled. If status is "cancelled", tell the user it's already done.
 
 ## COMMON POLICY MISTAKES TO AVOID
 Compensation:
